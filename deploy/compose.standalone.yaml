@@ -1,0 +1,43 @@
+# Minimal standalone LLDAP + Gateway example. Replace all example secrets before use.
+# For public use, connect NPM to this network; do not expose port 8080.
+services:
+  lldap:
+    image: lldap/lldap:latest
+    restart: unless-stopped
+    environment:
+      LLDAP_LDAP_BASE_DN: dc=example,dc=org
+      LLDAP_JWT_SECRET: ${LLDAP_JWT_SECRET:?set in .env}
+      LLDAP_KEY_SEED: ${LLDAP_KEY_SEED:?set in .env}
+      LLDAP_LDAP_USER_PASS: ${LLDAP_ADMIN_PASSWORD:?set in .env}
+    volumes:
+      - lldap_data:/data
+    # LDAP only if required by other clients; avoid public binding.
+    ports:
+      - "127.0.0.1:3890:3890"
+  lldap-rest-gateway:
+    image: ghcr.io/quantatheist/lldap-rest-gateway:main
+    restart: unless-stopped
+    depends_on:
+      - lldap
+    environment:
+      LLDAP_URL: http://lldap:17170
+      LLDAP_USERNAME: admin
+      LLDAP_PASSWORD_FILE: /run/secrets/lldap_api_password
+      CLIENTS_FILE: /run/secrets/gateway_clients
+      RATE_LIMIT_PER_MINUTE: "60"
+    secrets: [lldap_api_password, gateway_clients]
+    read_only: true
+    tmpfs: [/tmp:rw,noexec,nosuid,size=8m]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    # Uncomment for local-only testing:
+    # ports: ["127.0.0.1:18080:8080"]
+secrets:
+  lldap_api_password:
+    file: ./secrets/lldap_api_password
+  gateway_clients:
+    file: ./secrets/gateway_clients.json
+volumes:
+  lldap_data:

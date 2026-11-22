@@ -3,8 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,7 +17,7 @@ import (
 	"time"
 )
 
-type Config struct{ LLDAPURL, Username, Password, Listen string; APIKeyHash [32]byte }
+type Config struct{ LLDAPURL, Username, Password, Listen string }
 type App struct {
 	cfg        Config
 	http       *http.Client
@@ -52,21 +50,23 @@ func secret(k string) string {
 }
 func main() {
 	cfg := Config{LLDAPURL: env("LLDAP_URL", "http://lldap:17170"), Username: env("LLDAP_USERNAME", "admin"), Password: secret("LLDAP_PASSWORD"), Listen: env("LISTEN_ADDR", ":8080")}
-	apiKey := secret("API_KEY")
-	if cfg.Password == "" || len(apiKey) < 32 {
+	if cfg.Password == "" {
 		slog.Error("missing required configuration")
 		os.Exit(1)
 	}
 	u, e := url.Parse(cfg.LLDAPURL)
-	if e != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	if e != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" {
 		panic("invalid LLDAP_URL")
 	}
-	cfg.APIKeyHash = sha256.Sum256([]byte(apiKey))
+rpm, e := strconv.Atoi(env("RATE_LIMIT_PER_MINUTE","60"))
+ if e != nil {slog.Error("invalid RATE_LIMIT_PER_MINUTE");os.Exit(1)}
+ authenticator, e := loadAuthenticator(os.Getenv("CLIENTS_FILE"),rpm)
+ if e != nil {slog.Error("invalid client configuration","error",e);os.Exit(1)}
 	a := &App{cfg: cfg, http: &http.Client{Timeout: 10 * time.Second}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, r *http.Request) { jsonOut(w, 200, map[string]string{"status": "ok"}) })
 	mux.HandleFunc("GET /health/ready", a.ready)
-	mux.Handle("/api/v1/", a.auth(http.HandlerFunc(a.route)))
+	mux.Handle("/api/v1/", authenticator.middleware(http.HandlerFunc(a.route)))
 	server := &http.Server{Addr: cfg.Listen, Handler: securityHeaders(mux), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
 	slog.Info("gateway listening", "addr", cfg.Listen)
 	if e := server.ListenAndServe(); e != nil {
@@ -181,7 +181,7 @@ func (a *App) gql(ctx context.Context, q string, vars any) (json.RawMessage, err
 func readBody(r *http.Request) (map[string]any, error) {
 	defer r.Body.Close()
 	var v map[string]any
-	d := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	d := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
 	d.DisallowUnknownFields()
 	if e := d.Decode(&v); e != nil {
 		return nil, e
@@ -189,6 +189,7 @@ func readBody(r *http.Request) (map[string]any, error) {
 	if v == nil {
 		return nil, errors.New("expected object")
 	}
+	if r.ContentLength > 1<<20 {return nil, errors.New("request body too large")}
 	var extra any
 	if e := d.Decode(&extra); e != io.EOF {
 		return nil, errors.New("unexpected trailing data")
@@ -235,13 +236,13 @@ func (a *App) route(w http.ResponseWriter, r *http.Request) {
 		if method == "GET" {
 			scope = "users:read"
 		} else {
-			scope = "users:write"
+			scope = map[string]string{"POST":"users:create","PATCH":"users:update","DELETE":"users:delete"}[method]
 		}
 	case "groups":
 		if method == "GET" {
 			scope = "groups:read"
 		} else {
-			scope = "groups:write"
+			scope = map[string]string{"POST":"groups:create","PATCH":"groups:update","DELETE":"groups:delete"}[method]
 		}
 	case "schema":
 		scope = "schema:read"
@@ -249,6 +250,7 @@ func (a *App) route(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, "not found")
 		return
 	}
+	if scope == "" {fail(w,405,"method not allowed");return}
 	if !hasScope(r.Context(), scope) {
 		fail(w, 403, "insufficient scope")
 		return
@@ -350,19 +352,4 @@ type ctxKey struct{}
 func hasScope(ctx context.Context, needed string) bool {
 	scopes, _ := ctx.Value(ctxKey{}).(map[string]bool)
 	return scopes[needed] || scopes["*"]
-}
-func (a *App) auth(next http.Handler) http.Handler {
- return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-  key := r.Header.Get("X-API-Key")
-  if len(key) < 32 || len(key) > 4096 {
-   fail(w, 401, "invalid API key")
-   return
-  }
-  digest := sha256.Sum256([]byte(key))
-  if subtle.ConstantTimeCompare(digest[:], a.cfg.APIKeyHash[:]) != 1 {
-   fail(w, 401, "invalid API key")
-   return
-  }
-  next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, map[string]bool{"*": true})))
- })
 }
