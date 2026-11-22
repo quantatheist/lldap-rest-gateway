@@ -1,4 +1,5 @@
-# Add this service to the SAME Compose project as LLDAP.
+# Example for an EXISTING Compose stack with an LLDAP service named "lldap".
+# NPM must share this Compose network to proxy http://lldap-rest-gateway:8080.
 services:
   lldap-rest-gateway:
     image: ghcr.io/quantatheist/lldap-rest-gateway:main
@@ -7,22 +8,24 @@ services:
       - lldap
     environment:
       LLDAP_URL: http://lldap:17170
-      LLDAP_USERNAME: ${LLDAP_API_USERNAME:-admin}
+      LLDAP_USERNAME: ${LLDAP_API_USERNAME:?set LLDAP_API_USERNAME}
       LLDAP_PASSWORD_FILE: /run/secrets/lldap_api_password
-      API_KEY_FILE: /run/secrets/gateway_api_key
+      CLIENTS_FILE: /run/secrets/gateway_clients
+      RATE_LIMIT_PER_MINUTE: "60"
       LISTEN_ADDR: ":8080"
     secrets:
       - lldap_api_password
-      - gateway_api_key
+      - gateway_clients
     read_only: true
+    tmpfs: [/tmp:rw,noexec,nosuid,size=8m]
     cap_drop: [ALL]
-    security_opt:
-      - no-new-privileges:true
+    security_opt: [no-new-privileges:true]
     pids_limit: 64
     mem_limit: 128m
-
+    # No host ports. For local testing only:
+    # ports: ["127.0.0.1:18080:8080"]
 secrets:
   lldap_api_password:
     file: ./secrets/lldap_api_password
-  gateway_api_key:
-    file: ./secrets/gateway_api_key
+  gateway_clients:
+    file: ./secrets/gateway_clients.json
