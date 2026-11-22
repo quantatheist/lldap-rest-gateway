@@ -8,6 +8,7 @@ import (
  "encoding/json"
  "errors"
  "fmt"
+ "log/slog"
  "net/http"
  "os"
  "strings"
@@ -108,5 +109,5 @@ func auditRequest(clientName,method,path string,status int,duration time.Duratio
  if strings.HasPrefix(path,"/api/v1/users"){route="/api/v1/users"}
  if strings.HasPrefix(path,"/api/v1/groups"){route="/api/v1/groups"}
  if strings.HasPrefix(path,"/api/v1/schema"){route="/api/v1/schema"}
- slogAudit(clientName,method,route,status,duration)
+ slog.Info("api request", "client",clientName,"method",method,"route",route,"status",status,"duration_ms",duration.Milliseconds())
 }
