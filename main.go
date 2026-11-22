@@ -181,7 +181,7 @@ func (a *App) gql(ctx context.Context, q string, vars any) (json.RawMessage, err
 func readBody(r *http.Request) (map[string]any, error) {
 	defer r.Body.Close()
 	var v map[string]any
-	d := json.NewDecoder(io.LimitReader(r.Body, (1<<20)+1))
+	d := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
 	d.DisallowUnknownFields()
 	if e := d.Decode(&v); e != nil {
 		return nil, e
