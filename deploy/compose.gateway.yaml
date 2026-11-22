@@ -1,0 +1,30 @@
+services:
+  lldap-rest-gateway:
+    image: ghcr.io/YOUR_GITHUB_USER/lldap-rest-gateway:main
+    restart: unless-stopped
+    environment:
+      LLDAP_URL: http://lldap:17170
+      LLDAP_USERNAME: api-service
+      LLDAP_PASSWORD_FILE: /run/secrets/lldap_api_password
+      OIDC_ISSUER: https://auth.domain.tld/application/o/lldap-api/
+      OIDC_AUDIENCE: lldap-api
+      OIDC_JWKS_URL: https://auth.domain.tld/application/o/lldap-api/jwks/
+      ALLOWED_CLIENT_IDS: registration,automation
+    secrets:
+      - lldap_api_password
+    networks:
+      - ldap_internal
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 128m
+secrets:
+  lldap_api_password:
+    file: ./secrets/lldap_api_password
+networks:
+  ldap_internal:
+    external: true
