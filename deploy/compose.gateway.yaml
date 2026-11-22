@@ -1,30 +1,28 @@
+# Add this service to the SAME Compose project as LLDAP.
 services:
   lldap-rest-gateway:
-    image: ghcr.io/YOUR_GITHUB_USER/lldap-rest-gateway:main
+    image: ghcr.io/quantatheist/lldap-rest-gateway:main
     restart: unless-stopped
+    depends_on:
+      - lldap
     environment:
       LLDAP_URL: http://lldap:17170
-      LLDAP_USERNAME: api-service
+      LLDAP_USERNAME: ${LLDAP_API_USERNAME:-admin}
       LLDAP_PASSWORD_FILE: /run/secrets/lldap_api_password
-      OIDC_ISSUER: https://auth.domain.tld/application/o/lldap-api/
-      OIDC_AUDIENCE: lldap-api
-      OIDC_JWKS_URL: https://auth.domain.tld/application/o/lldap-api/jwks/
-      ALLOWED_CLIENT_IDS: registration,automation
+      API_KEY_FILE: /run/secrets/gateway_api_key
+      LISTEN_ADDR: ":8080"
     secrets:
       - lldap_api_password
-    networks:
-      - ldap_internal
+      - gateway_api_key
     read_only: true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=8m
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
     pids_limit: 64
     mem_limit: 128m
+
 secrets:
   lldap_api_password:
     file: ./secrets/lldap_api_password
-networks:
-  ldap_internal:
-    external: true
+  gateway_api_key:
+    file: ./secrets/gateway_api_key
