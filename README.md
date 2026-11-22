@@ -1,56 +1,65 @@
-# LLDAP REST Gateway (initial implementation)
+# LLDAP REST Gateway
 
-Standalone Go HTTP gateway for LLDAP GraphQL, with OIDC RS256 JWT validation, client allowlisting and OAuth scopes. This is an **initial implementation**, not yet production-audited. No database and no application-specific registration logic.
+Standalone Go REST-to-GraphQL adapter for LLDAP. **No Authentik, Symfony, OIDC, JWT, or external identity provider dependency.** Uses one static high-entropy API key for incoming REST requests, and a separate LLDAP service-account password for upstream GraphQL requests.
 
-## Supported endpoints
+## Authentication
 
-| Method | Path | Required scope |
-| --- | --- | --- |
-| GET | `/api/v1/users` | `users:read` |
-| GET | `/api/v1/users/{id}` | `users:read` |
-| POST | `/api/v1/users` | `users:write` |
-| PATCH | `/api/v1/users/{id}` | `users:write` |
-| DELETE | `/api/v1/users/{id}` | `users:write` |
-| GET | `/api/v1/groups` | `groups:read` |
-| GET | `/api/v1/groups/{id}` | `groups:read` |
-| POST | `/api/v1/groups` | `groups:write` |
-| PATCH | `/api/v1/groups/{id}` | `groups:write` |
-| DELETE | `/api/v1/groups/{id}` | `groups:write` |
-| PUT / DELETE | `/api/v1/groups/{id}/members/{userId}` | `groups:write`, `memberships:write` |
-| GET | `/api/v1/schema` | `schema:read` |
-| GET | `/health/live` | public |
-| GET | `/health/ready` | public |
+Every `/api/v1/` request requires the HTTP header `X-API-Key`. Configure `API_KEY_FILE` (preferred) or `API_KEY`. The API key must be at least 32 characters; generate a random key:
 
-`POST /users` passes the JSON object to `CreateUserInput`; `PATCH /users/{id}` passes it to `UpdateUserInput` with path `id`; `PATCH /groups/{id}` passes it to `UpdateGroupInput` with path `id`. Input field names must match the installed LLDAP GraphQL schema. `POST /groups` expects `{"displayName":"example"}`. LLDAP GraphQL errors currently map to HTTP 502, not detailed REST 4xx errors. Membership PUT/DELETE currently forwards LLDAP mutations directly and **is not guaranteed idempotent**. Do not rely on it for retry-safe workflows without additional reconciliation.
+```sh
+mkdir -p secrets && chmod 700 secrets
+openssl rand -hex 32 > secrets/gateway_api_key
+chmod 600 secrets/gateway_api_key
+printf '%s' 'YOUR_LLDAP_SERVICE_ACCOUNT_PASSWORD' > secrets/lldap_api_password
+chmod 600 secrets/lldap_api_password
+```
+
+Do not commit secrets. The API key is hashed in memory with SHA-256 and compared in constant time. The configured key grants **all** API operations; there are no per-client or per-group permissions. Rotate by changing the secret and restarting the container. Never expose the API without HTTPS, VPN, or a trusted internal network.
 
 ## Configuration
 
-Required: `LLDAP_PASSWORD` or `LLDAP_PASSWORD_FILE`, `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_JWKS_URL` (HTTPS), `ALLOWED_CLIENT_IDS` (comma-separated exact client IDs). Optional: `LLDAP_URL` (default `http://lldap:17170`), `LLDAP_USERNAME` (default `admin`), `LISTEN_ADDR` (default `:8080`).
+| Variable | Required | Default |
+| --- | --- | --- |
+| `LLDAP_URL` | No | `http://lldap:17170` |
+| `LLDAP_USERNAME` | No | `admin` |
+| `LLDAP_PASSWORD_FILE` or `LLDAP_PASSWORD` | Yes | — |
+| `API_KEY_FILE` or `API_KEY` | Yes | — |
+| `LISTEN_ADDR` | No | `:8080` |
 
-Access tokens must be **RS256-signed JWTs** with matching `iss`, `aud`, `exp`, client ID in `client_id` or `azp`, and space-delimited `scope` or `scp` array. The gateway does not issue tokens. Confirm that your Authentik provider actually emits these claims in access tokens. JWKS is cached for 5 minutes; signing-key rotation can cause temporary failures. LLDAP login tokens are cached for 10 minutes and renewed on 401.
+The gateway logs into LLDAP using `/auth/simple/login`, then forwards predefined GraphQL operations to `/api/graphql`. It does not expose an arbitrary GraphQL proxy.
 
-**Security limits:** No per-group authorization, no built-in rate limiting, no audit trail, no token revocation introspection, no OpenAPI document, no full attribute-schema mutation endpoints, and no password reset support yet. Use a dedicated LLDAP account with appropriate privileges; verify LLDAP permissions. Restrict Docker network access and consider NPM access lists or VPN before exposing it publicly. `groups:write` is broad; do not give it to untrusted clients. The `*` scope grants all actions. Do not use production secrets in git.
+## Endpoints
 
-## Local build and tests
+| Method | Path |
+| --- | --- |
+| GET, POST | `/api/v1/users` |
+| GET, PATCH, DELETE | `/api/v1/users/{id}` |
+| GET, POST | `/api/v1/groups` |
+| GET, PATCH, DELETE | `/api/v1/groups/{id}` |
+| PUT, DELETE | `/api/v1/groups/{id}/members/{userId}` |
+| GET | `/api/v1/schema` |
+| GET | `/health/live`, `/health/ready` (public) |
 
-```bash
+Example:
+
+```sh
+curl -H "X-API-Key: $GATEWAY_API_KEY" http://lldap-rest-gateway:8080/api/v1/users
+```
+
+## Deployment
+
+Add `deploy/compose.gateway.yaml`'s service and top-level secrets to the **existing LLDAP Compose file**. Since the containers are in the same Compose project, Docker DNS resolves `lldap` without extra networks. No `ports` mapping is needed for same-network clients. Keep the existing `ldap.domain.tld` Nginx Proxy Manager host pointing at LLDAP. Do not publish the gateway on a public host until TLS, network restrictions, and abuse protection are in place.
+
+## Build and publish
+
+```sh
 go test ./...
-go build -trimpath -o gateway .
+go vet ./...
 docker build -t lldap-rest-gateway:dev .
 ```
 
-## Deployment into an existing LDAP stack
+GitHub Actions builds multi-architecture images on push to `main` and tags, publishing to GHCR.
 
-1. Create a dedicated shared external network if needed: `docker network create ldap_internal`.
-2. Attach your **existing** `lldap` service to that network, keeping its current volume, database, ports and NPM host `ldap.domain.tld` unchanged. The gateway expects DNS name `lldap` on that network; add an alias if your service is named differently.
-3. Set the real GHCR owner in `deploy/compose.gateway.yaml`. Configure an Authentik OAuth/OIDC provider with RS256-signed JWT access tokens, appropriate audience, client identifier and scopes. Verify the JWKS URL and issuer against your actual Authentik discovery document; the included URLs are placeholders.
-4. Put the LLDAP service-account password in `deploy/secrets/lldap_api_password` (chmod 600, never commit). The example compose file is standalone; from its directory run `docker compose -f compose.gateway.yaml up -d`.
-5. Connect the Symfony app or any other client to `http://lldap-rest-gateway:8080` via a shared internal Docker network. Do not point it at `ldap.domain.tld`; that domain can continue to serve the LLDAP UI and GraphQL for legacy clients.
-6. Optionally connect gateway to the NPM network and create **a separate** `ldap-api.domain.tld` proxy host forwarding to `lldap-rest-gateway:8080`. Enable HTTPS, restrict access, and apply edge rate limits.
-7. Check `GET /health/live` and `GET /health/ready`, then test read-only API calls before any write operations.
+## Limitations
 
-For multi-stack deployment, ensure both stacks reference the **same external Docker network** and the gateway service is discoverable from clients. The example compose intentionally attaches only `ldap_internal` and does not expose any host ports.
-
-## GHCR
-
-Push to `main` to trigger `.github/workflows/image.yml`. This builds amd64/arm64 images and publishes `ghcr.io/<owner>/<repo>:main` and a SHA tag. Version tags such as `v0.1.0` publish a semver tag. Set package visibility/permissions in GitHub as needed. GitHub Actions workflows are supplied but have not been executed here.
+This remains an initial implementation, **not production-audited**. Single all-powerful API key, no rate limiting or audit trail, no OpenAPI document, no complete attribute-schema mutations, and no password reset. LLDAP GraphQL errors map to HTTP 502; membership PUT/DELETE are not guaranteed idempotent. Verify against your installed LLDAP version before using write operations. `/health/ready` tests only HTTP reachability, not successful LLDAP login.

@@ -3,16 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto"
-	"crypto/rsa"
 	"crypto/sha256"
-	"encoding/base64"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,16 +19,13 @@ import (
 	"time"
 )
 
-type Config struct{ LLDAPURL, Username, Password, Issuer, Audience, JWKSURL, Listen, AllowedClients string }
+type Config struct{ LLDAPURL, Username, Password, Listen string; APIKeyHash [32]byte }
 type App struct {
 	cfg        Config
 	http       *http.Client
 	mu         sync.Mutex
 	token      string
 	tokenUntil time.Time
-	keysMu     sync.Mutex
-	keys       map[string]*rsa.PublicKey
-	keysUntil  time.Time
 }
 type gqlResponse struct {
 	Data   json.RawMessage `json:"data"`
@@ -57,8 +51,9 @@ func secret(k string) string {
 	return os.Getenv(k)
 }
 func main() {
-	cfg := Config{LLDAPURL: env("LLDAP_URL", "http://lldap:17170"), Username: env("LLDAP_USERNAME", "admin"), Password: secret("LLDAP_PASSWORD"), Issuer: os.Getenv("OIDC_ISSUER"), Audience: os.Getenv("OIDC_AUDIENCE"), JWKSURL: os.Getenv("OIDC_JWKS_URL"), Listen: env("LISTEN_ADDR", ":8080"), AllowedClients: os.Getenv("ALLOWED_CLIENT_IDS")}
-	if cfg.Password == "" || cfg.Issuer == "" || cfg.Audience == "" || cfg.JWKSURL == "" || cfg.AllowedClients == "" {
+	cfg := Config{LLDAPURL: env("LLDAP_URL", "http://lldap:17170"), Username: env("LLDAP_USERNAME", "admin"), Password: secret("LLDAP_PASSWORD"), Listen: env("LISTEN_ADDR", ":8080")}
+	apiKey := secret("API_KEY")
+	if cfg.Password == "" || len(apiKey) < 32 {
 		slog.Error("missing required configuration")
 		os.Exit(1)
 	}
@@ -66,10 +61,7 @@ func main() {
 	if e != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		panic("invalid LLDAP_URL")
 	}
-	j, e := url.Parse(cfg.JWKSURL)
-	if e != nil || j.Scheme != "https" || j.Host == "" || j.User != nil {
-		panic("OIDC_JWKS_URL must be HTTPS")
-	}
+	cfg.APIKeyHash = sha256.Sum256([]byte(apiKey))
 	a := &App{cfg: cfg, http: &http.Client{Timeout: 10 * time.Second}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, r *http.Request) { jsonOut(w, 200, map[string]string{"status": "ok"}) })
@@ -359,160 +351,18 @@ func hasScope(ctx context.Context, needed string) bool {
 	scopes, _ := ctx.Value(ctxKey{}).(map[string]bool)
 	return scopes[needed] || scopes["*"]
 }
-func decodePart(s string) ([]byte, error) { return base64.RawURLEncoding.DecodeString(s) }
-func (a *App) jwks(ctx context.Context) (map[string]*rsa.PublicKey, error) {
-	a.keysMu.Lock()
-	defer a.keysMu.Unlock()
-	if len(a.keys) > 0 && time.Now().Before(a.keysUntil) {
-		return a.keys, nil
-	}
-	req, e := http.NewRequestWithContext(ctx, "GET", a.cfg.JWKSURL, nil)
-	if e != nil {
-		return nil, e
-	}
-	resp, e := a.http.Do(req)
-	if e != nil {
-		return nil, e
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, errors.New("jwks fetch failed")
-	}
-	var raw struct {
-		Keys []map[string]string `json:"keys"`
-	}
-	if e = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&raw); e != nil {
-		return nil, e
-	}
-	keys := map[string]*rsa.PublicKey{}
-	for _, k := range raw.Keys {
-		if k["kty"] != "RSA" || k["kid"] == "" || (k["alg"] != "" && k["alg"] != "RS256") || (k["use"] != "" && k["use"] != "sig") {
-			continue
-		}
-		n, e1 := decodePart(k["n"])
-		ex, e2 := decodePart(k["e"])
-		if e1 != nil || e2 != nil || len(n) < 256 || len(ex) == 0 || len(ex) > 4 {
-			continue
-		}
-		exp := new(big.Int).SetBytes(ex)
-		if !exp.IsInt64() || exp.Int64() < 3 || exp.Int64() > 1<<24 {
-			continue
-		}
-		keys[k["kid"]] = &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: int(exp.Int64())}
-	}
-	if len(keys) == 0 {
-		return nil, errors.New("no acceptable signing keys")
-	}
-	a.keys = keys
-	a.keysUntil = time.Now().Add(5 * time.Minute)
-	return keys, nil
-}
-func (a *App) validate(ctx context.Context, tok string) (map[string]bool, error) {
-	parts := strings.Split(tok, ".")
-	if len(parts) != 3 {
-		return nil, errors.New("malformed token")
-	}
-	hb, e := decodePart(parts[0])
-	if e != nil {
-		return nil, e
-	}
-	pb, e := decodePart(parts[1])
-	if e != nil {
-		return nil, e
-	}
-	sig, e := decodePart(parts[2])
-	if e != nil {
-		return nil, e
-	}
-	var h struct{ Alg, Kid, Typ string }
-	if e = json.Unmarshal(hb, &h); e != nil || h.Alg != "RS256" || h.Kid == "" {
-		return nil, errors.New("unsupported JWT")
-	}
-	keys, e := a.jwks(ctx)
-	if e != nil {
-		return nil, e
-	}
-	key := keys[h.Kid]
-	if key == nil {
-		return nil, errors.New("unknown signing key")
-	}
-	hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
-	if e = rsa.VerifyPKCS1v15(key, crypto.SHA256, hash[:], sig); e != nil {
-		return nil, e
-	}
-	var claims map[string]any
-	if e = json.Unmarshal(pb, &claims); e != nil {
-		return nil, e
-	}
-	if claims["iss"] != a.cfg.Issuer {
-		return nil, errors.New("issuer mismatch")
-	}
-	audOK := false
-	switch v := claims["aud"].(type) {
-	case string:
-		audOK = v == a.cfg.Audience
-	case []any:
-		for _, s := range v {
-			if s == a.cfg.Audience {
-				audOK = true
-			}
-		}
-	}
-	if !audOK {
-		return nil, errors.New("audience mismatch")
-	}
-	now := float64(time.Now().Unix())
-	exp, ok := claims["exp"].(float64)
-	if !ok || exp <= now {
-		return nil, errors.New("expired token")
-	}
-	if nbf, ok := claims["nbf"].(float64); ok && nbf > now+30 {
-		return nil, errors.New("token not yet valid")
-	}
-	if iat, ok := claims["iat"].(float64); ok && iat > now+30 {
-		return nil, errors.New("future issued token")
-	}
-	client, _ := claims["client_id"].(string)
-	if client == "" {
-		client, _ = claims["azp"].(string)
-	}
-	allowed := false
-	for _, c := range strings.Split(a.cfg.AllowedClients, ",") {
-		if strings.TrimSpace(c) == client && client != "" {
-			allowed = true
-		}
-	}
-	if !allowed {
-		return nil, errors.New("client not allowed")
-	}
-	scopes := map[string]bool{}
-	if s, ok := claims["scope"].(string); ok {
-		for _, x := range strings.Fields(s) {
-			scopes[x] = true
-		}
-	}
-	if s, ok := claims["scp"].([]any); ok {
-		for _, x := range s {
-			if v, ok := x.(string); ok {
-				scopes[v] = true
-			}
-		}
-	}
-	return scopes, nil
-}
 func (a *App) auth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		header := r.Header.Get("Authorization")
-		if !strings.HasPrefix(header, "Bearer ") {
-			fail(w, 401, "bearer token required")
-			return
-		}
-		scopes, e := a.validate(r.Context(), strings.TrimPrefix(header, "Bearer "))
-		if e != nil {
-			slog.Warn("access denied", "reason", e.Error())
-			fail(w, 401, "invalid token")
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, scopes)))
-	})
+ return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+  key := r.Header.Get("X-API-Key")
+  if len(key) < 32 || len(key) > 4096 {
+   fail(w, 401, "invalid API key")
+   return
+  }
+  digest := sha256.Sum256([]byte(key))
+  if subtle.ConstantTimeCompare(digest[:], a.cfg.APIKeyHash[:]) != 1 {
+   fail(w, 401, "invalid API key")
+   return
+  }
+  next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, map[string]bool{"*": true})))
+ })
 }
