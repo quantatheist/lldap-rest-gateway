@@ -1,47 +1,37 @@
 package main
 
 import (
-	"context"
-	"crypto"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/json"
-	"math/big"
-	"net/http"
-	"net/http/httptest"
-	"testing"
-	"time"
+ "context"
+ "crypto/sha256"
+ "net/http"
+ "net/http/httptest"
+ "strings"
+ "testing"
 )
 
-func TestJWTAndScopes(t *testing.T) {
-	key, e := rsa.GenerateKey(rand.Reader, 2048)
-	if e != nil {
-		t.Fatal(e)
-	}
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"keys": []any{map[string]string{"kid": "test", "kty": "RSA", "alg": "RS256", "n": base64.RawURLEncoding.EncodeToString(key.N.Bytes()), "e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.E)).Bytes())}}})
-	}))
-	defer server.Close()
-	a := &App{cfg: Config{Issuer: "issuer", Audience: "api", JWKSURL: server.URL, AllowedClients: "app"}, http: server.Client()}
-	enc := func(v any) string { b, _ := json.Marshal(v); return base64.RawURLEncoding.EncodeToString(b) }
-	header := enc(map[string]any{"alg": "RS256", "kid": "test"})
-	payload := enc(map[string]any{"iss": "issuer", "aud": "api", "client_id": "app", "exp": time.Now().Add(time.Hour).Unix(), "scope": "users:read groups:read"})
-	signed := header + "." + payload
-	h := sha256.Sum256([]byte(signed))
-	sig, e := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, h[:])
-	if e != nil {
-		t.Fatal(e)
-	}
-	scopes, e := a.validate(context.Background(), signed+"."+base64.RawURLEncoding.EncodeToString(sig))
-	if e != nil {
-		t.Fatal(e)
-	}
-	if !scopes["users:read"] || scopes["users:write"] {
-		t.Fatal("unexpected scopes")
-	}
-	if _, e = a.validate(context.Background(), signed+".bad"); e == nil {
-		t.Fatal("accepted bad signature")
-	}
+func TestAPIKeyAuthentication(t *testing.T) {
+ key := strings.Repeat("a", 48)
+ app := &App{cfg: Config{APIKeyHash: sha256.Sum256([]byte(key))}}
+ handler := app.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+  if !hasScope(r.Context(), "users:write") { t.Error("authenticated request lacks permission") }
+  w.WriteHeader(http.StatusNoContent)
+ }))
+ for _, tc := range []struct{name, key string; status int}{
+  {"valid", key, http.StatusNoContent},
+  {"missing", "", http.StatusUnauthorized},
+  {"wrong", strings.Repeat("b", 48), http.StatusUnauthorized},
+  {"short", "abc", http.StatusUnauthorized},
+ } {
+  t.Run(tc.name, func(t *testing.T) {
+   req := httptest.NewRequest(http.MethodGet, "/api/v1/users", nil)
+   if tc.key != "" { req.Header.Set("X-API-Key", tc.key) }
+   rec := httptest.NewRecorder()
+   handler.ServeHTTP(rec, req)
+   if rec.Code != tc.status { t.Fatalf("status %d, want %d", rec.Code, tc.status) }
+  })
+ }
+}
+
+func TestMissingScope(t *testing.T) {
+ if hasScope(context.Background(), "users:read") { t.Fatal("unauthenticated scope accepted") }
 }
